@@ -1,6 +1,6 @@
 package Parallel::Loops;
 
-our $VERSION='0.01';
+our $VERSION='0.03';
 
 =head1 NAME
 
@@ -13,53 +13,57 @@ Parallel::Loops - Execute loops using parallel forked subprocesses
     use Parallel::Loops;
 
     my $maxProcs = 5;
-    my $pl = new Parallel::Loops($maxProcs);
+    my $pl = Parallel::Loops->new($maxProcs);
 
-    my @input = ( 0 .. 9 );
+    my @parameters = ( 0 .. 9 );
 
-    # We want to perform some hefty calculation for each @input and store each
-    # calculation's result in %output. For that reason, we "tie" %output, so
-    # that changes to %output in any child process (see below) are
-    # automatically transfered and updated in the parent also.
+    # We want to perform some hefty calculation for each @input and
+    # store each calculation's result in %output. For that reason, we
+    # "tie" %output, so that changes to %output in any child process
+    # (see below) are automatically transfered and updated in the
+    # parent also.
 
-    my %output;
-    $pl->tieOutput( \%output );
+    my %returnValues;
+    $pl->share( \%returnValues );
 
-    $pl->foreach(
-        \@input,
-        sub {
-            # This sub "magically" executed in parallel forked child
-            # processes
+    $pl->foreach( \@parameters, sub {
+        # This sub "magically" executed in parallel forked child
+        # processes
 
-            # Lets just create a simple example, but this could be a
-            # massive calculation that will be parallelized, so that
-            # $maxProcs different processes are calculating sqrt
-            # simultaneously for different values of $_ on different CPUs
+        # Lets just create a simple example, but this could be a
+        # massive calculation that will be parallelized, so that
+        # $maxProcs different processes are calculating sqrt
+        # simultaneously for different values of $_ on different CPUs
 
-            $output{$_} = sqrt($_);
-        }
-    );
-    foreach (@input) {
-        printf "i: %d sqrt(i): %f\n", $_, $output{$_};
+        $returnValues{$_} = sqrt($_);
+    });
+    foreach (@parameters) {
+        printf "i: %d sqrt(i): %f\n", $_, $returnValues{$_};
     }
   
 You can also use @arrays instead of %hashes, and/or while loops
 instead of foreach:
 
-    my @output;
-    $pl->tieOutput(\@output);
+    my @returnValues;
+    $pl->share(\@returnValues);
 
     my $i = 0;
-    $pl->while (
-        sub { $i++ < 10 },
-        sub {
+    $pl->while ( sub { $i++ < 10 }, sub {
+        # This sub "magically" executed in parallel forked
+        # child processes
 
-            # This sub "magically" executed in parallel forked
-            # child processes
+        push @returnValues, [ $i, sqrt($i) ];
+    });
 
-            push @output, [ $i, sqrt($i) ];
-        }
-    );
+And you can have both foreach and while return values so that $pl->share()
+isn't required at all:
+
+    my $maxProcs = 5;
+    my $pl = Parallel::Loops->new($maxProcs);
+    my %returnValues = $pl->foreach( [ 0..9 ], sub {
+        # Again, this is executed in a forked child
+        $_ => sqrt($_);
+    });
 
 =head1 DESCRIPTION
 
@@ -70,16 +74,16 @@ could be carried out in any order.
 This module allows you to run such loops in parallel using all the
 CPUs at your disposal.
 
-Output is automatically transfered from children to parents via
+Return values are automatically transfered from children to parents via
 %hashes or @arrays, that have explicitly been configured for that sort
-of monitoring via $pl->tieOutput(). Hashes will transfer keys that are
+of sharing via $pl->share(). Hashes will transfer keys that are
 set in children (but not cleared or unset), and elements that are
 pushed to @arrays in children are pushed to the parent @array too (but
 note that the order is not guaranteed to be the same as it would have
 been if done all in one process, since there is no way of knowing
 which child would finish first!)
 
-If you can see past the slightly weird syntax, you're basically
+If you can see past the slightly awkward syntax, you're basically
 getting foreach and while loops that can run in parallel without
 having to bother with fork, pipes, signals etc. This is all handled
 for you by this module.
@@ -88,17 +92,17 @@ for you by this module.
 
     $pl->foreach($arrayRef, $childBodySub)
 
-Runs $childBodySub->() with $_ set foreach element in @$arrayRef,
-except that $childBodySub is run in a forked child process to obtain
-parallelism. Essentially, this does something conceptually similar to:
+Runs $childBodySub->() with $_ set foreach element in @$arrayRef, except that
+$childBodySub is run in a forked child process to obtain parallelism.
+Essentially, this does something conceptually similar to:
 
     foreach(@$arrayRef) {
         $childBodySub->();
     }
 
 Any setting of hash keys or pushing to arrays that have been set with
-$pl->tieOutput() will automagically appear in the hash or array in the
-parent process.
+$pl->share() will automagically appear in the hash or array in the parent
+process.
 
 If you like loop variables, you can run it like so:
 
@@ -119,7 +123,7 @@ Essentially, this does something conceptually similar to:
   }
 
 except that $childBodySub->() is executed in a forked child process.
-Output is transfered via tieOutput() like in L</foreach loop> above.
+Return values are transfered via share() like in L</foreach loop> above.
 
 =head3 while loops must affect condition outside $childBodySub
 
@@ -142,30 +146,30 @@ the $childBodySub so it is executed in the parent. (Adhering to
 the parallel principle that one iteration may not affect any other
 iterations - including whether to run them or not) 
 
-=head2 tieOutput
+=head2 share
 
-  $pl->tieOutput(\%output, \@output, ...)
+  $pl->share(\%output, \@output, ...)
 
-Each of the arguments to tieOutput() are instrumented, so that when a
+Each of the arguments to share() are instrumented, so that when a
 hash key is set or array element pushed in a child, this is transfered
 to the parent's hash or array automatically when a child is finished.
 
-B<Note the limitation> Only keys being set like C<$hash{'key'} =
-'value'> and arrays elements being pushed like C<push @array, 'value'>
-will be transfered to the parent. Unsetting keys, or setting
-particluar array elements with $array[3]='value' will be lost if done
-in the children. In the parent process all the %hashes and @arrays are
-full-fledged, and you can used all operations. But only these
-operations in the child processes make it back to the parent.
+B<Note the limitation> Only keys being set like C<$hash{'key'} = 'value'> and
+arrays elements being pushed like C<push @array, 'value'> will be transfered to
+the parent. Unsetting keys, or setting particluar array elements with
+$array[3]='value' will be lost if done in the children. In the parent process
+all the %hashes and @arrays are full-fledged, and you can use all operations.
+But only these mentioned operations in the child processes make it back to the
+parent.
 
 =head3 Array element sequence not defined
 
-Note that when using tieOutput() for @output arrays, the sequence of
-elements in @output is not guaranteed to be the same as you'd see with
-a normal sequential while or foreach loop, since the calculations are
-done in parallel and the children may end in an unexpected sequence.
-But if you don't really care about the order of elements in the
-@output array then tieOutput-ing an array can be useful and fine.
+Note that when using share() for @returnValue arrays, the sequence of elements
+in @returnValue is not guaranteed to be the same as you'd see with a normal
+sequential while or foreach loop, since the calculations are done in parallel
+and the children may end in an unexpected sequence.  But if you don't really
+care about the order of elements in the @returnValue array then share-ing an
+array can be useful and fine.
 
 If you need to be able to determine which iteration generated what output, use
 a hash instead.
@@ -177,8 +181,7 @@ process encouters a loop that it executes in parallel, and the
 execution of the loop in child processes also encounters a parallel
 loop, these will also be forked, and you'll essentially have
 $maxProcs^2 running processes. It wouldn't be too hard to implement
-such a check (either inside or outside this package) but maybe this is
-what a programmer actually wants, so it isn't implemented.
+such a check (either inside or outside this package).
 
 =head1 SEE ALSO
 
@@ -202,7 +205,7 @@ I believe this is the only dependency that isn't part of core perl:
 
 These should all be in perl's core:
 
-    use Data::Dumper;
+    use Storable;
     use IO::Handle;
     use Tie::Array;
     use Tie::Hash;
@@ -214,8 +217,12 @@ No bugs are known at the moment. Send any reports to peter@morch.com.
 
 Enhancements:
 
-Use Storable instead of Data::Dumper - its probably faster and better suited to
-these needs. L<http://www.unix.com.ua/orelly/linux/dbi/ch02_05.htm>
+Optionally prevent recursive forking: If a forked child encounters a
+Parallel::Loop it should be possible to prevent that Parallel::Loop instance to
+also create forks.
+
+Determine the number of CPUs so that new()'s $maxProcs parameter can be
+optional. Could use e.g. Sys::Sysconf, UNIX::Processors or Sys::CPU.
 
 Maybe use function prototypes (see Prototypes under perldoc perlsub). 
 
@@ -265,17 +272,17 @@ use strict;
 use warnings;
 
 use IO::Handle;
-use Data::Dumper;
+use Storable;
 use Parallel::ForkManager;
 use UNIVERSAL qw(isa);
 
 sub new {
     my ($class, $maxProcs) = @_;
-    my $self = { maxProcs => $maxProcs, tieOutputNr => 0 };
+    my $self = { maxProcs => $maxProcs, shareNr => 0 };
     return bless $self, $class;
 }
 
-sub tieOutput {
+sub share {
     my ($self, @tieRefs) = @_;
     foreach my $ref (@tieRefs) {
         if (ref $ref && isa $ref, 'HASH') {
@@ -283,17 +290,17 @@ sub tieOutput {
             my $storage;
             tie %$ref, 'Parallel::Loops::TiedHash', $self, \$storage;
             push @{$$self{tieObjects}}, $storage;
-            push @{$$self{tieHashes}}, [$$self{tieOutputNr}, $ref];
+            push @{$$self{tieHashes}}, [$$self{shareNr}, $ref];
         } elsif (ref $ref && isa $ref, 'ARRAY') {
             # $storage will point to the Parallel::Loops::TiedArray object
             my $storage;
             tie @$ref, 'Parallel::Loops::TiedArray', $self, \$storage;
             push @{$$self{tieObjects}}, $storage;
-            push @{$$self{tieArrays}}, [$$self{tieOutputNr}, $ref];
+            push @{$$self{tieArrays}}, [$$self{shareNr}, $ref];
         } else {
-            die "Only hash and array refs are supported by tieOutput";
+            die "Only hash and array refs are supported by share";
         }
-        $$self{tieOutputNr}++;
+        $$self{shareNr}++;
     }
 }
 
@@ -308,8 +315,9 @@ sub readChangesFromChild {
     while (<$childRdr>) {
         $childOutput .= $_;
     }
-    my @output;
-    eval $childOutput;
+    my @output = @{ Storable::thaw($childOutput) };
+    my $retval = shift @output;
+
     foreach my $set (@{$$self{tieHashes}}) {
         my ($outputNr, $h) = @$set;
         foreach my $k (keys %{$output[$outputNr]}) {
@@ -322,67 +330,17 @@ sub readChangesFromChild {
             push @$a, $v;
         }
     }
+    return @$retval;
 }
 
 sub printChangesToParent {
-    my ($self, $parentWtr) = @_;
+    my ($self, $retval, $parentWtr) = @_;
     my $outputNr = 0;
+    my @childInfo = ($retval);
     foreach (@{$$self{tieObjects}}) {
-       print $parentWtr $_->dumpChildInfo($outputNr++); 
+        push @childInfo, $_->getChildInfo();
     }
-}
-
-sub foreach {
-    my ($self, $varRef, $arrayRef, $sub);
-    if (ref $_[1] eq 'ARRAY') {
-        ($self, $arrayRef, $sub) = @_;
-    } else {
-        ($self, $varRef, $arrayRef, $sub) = @_;
-    }
-    my %childHandles;
-    my $fm = Parallel::ForkManager->new($$self{maxProcs});
-    $$self{forkManager} = $fm;
-    $fm->run_on_finish( sub {
-        my ($pid) = @_;
-        my $childRdr = $childHandles{$pid};
-        $self->readChangesFromChild($childRdr);
-    });
-    my $childCounter = 0;
-    foreach my $i (@$arrayRef) {
-        # Setup pipes so the child can send info back to the parent about
-        # output data.
-        my $parentWtr = IO::Handle->new();
-        my $childRdr  = IO::Handle->new();
-        pipe( $childRdr, $parentWtr )
-            or die "Couldn't open a pipe";
-        $parentWtr->autoflush(1);
-        
-        my $pid = $fm->start( ++$childCounter );
-
-        if ($pid) {
-            # We're running in the parent...
-            close $parentWtr;
-            $childHandles{$pid} = $childRdr;
-            next; 
-        }
-
-        # Setup either $varRef or $_, if no such given before calling $sub->()
-        if ($varRef) {
-            $$varRef = $i;
-        } else {
-            $_ = $i;
-        }
-
-        # We're running in the child
-        $sub->();
-
-        $self->printChangesToParent($parentWtr);
-        close $parentWtr;
-
-        $fm->finish($childCounter);    # pass an exit code to finish
-    }
-    $fm->wait_all_children;
-    delete $$self{forkManager};
+    print $parentWtr Storable::freeze(\@childInfo); 
 }
 
 sub while {
@@ -390,10 +348,11 @@ sub while {
     my %childHandles;
     my $fm = Parallel::ForkManager->new($$self{maxProcs});
     $$self{forkManager} = $fm;
+    my @retvals;
     $fm->run_on_finish( sub {
         my ($pid) = @_;
         my $childRdr = $childHandles{$pid};
-        $self->readChangesFromChild($childRdr);
+        push @retvals, $self->readChangesFromChild($childRdr);
     });
     my $childCounter = 0;
     while ($continueSub->()) {
@@ -403,6 +362,8 @@ sub while {
         my $childRdr  = IO::Handle->new();
         pipe( $childRdr, $parentWtr )
             or die "Couldn't open a pipe";
+        binmode $parentWtr;
+        binmode $childRdr;
         $parentWtr->autoflush(1);
         
         my $pid = $fm->start( ++$childCounter );
@@ -415,15 +376,49 @@ sub while {
         }
 
         # We're running in the child
-        $bodySub->();
+        my @retval = $bodySub->();
+        if (! defined wantarray) {
+            # Lets not waste any energy printing stuff to the parent, if the
+            # parent isn't going to use the return values anyway
+            @retval = ();
+        }
 
-        $self->printChangesToParent($parentWtr);
+        $self->printChangesToParent(\@retval, $parentWtr);
         close $parentWtr;
 
         $fm->finish($childCounter);    # pass an exit code to finish
     }
     $fm->wait_all_children;
     delete $$self{forkManager};
+    return @retvals;
+}
+
+# foreach is implemented via while above
+sub foreach {
+    my ($self, $varRef, $arrayRef, $sub);
+    if (ref $_[1] eq 'ARRAY') {
+        ($self, $arrayRef, $sub) = @_;
+    } else {
+        # Note that this second usage is not documented (and hence not
+        # supported). It isn't really useful, but this is how to use it just in
+        # case:
+        #
+        # my $foo;
+        # my %returnValues = $pl->foreach( \$foo, [ 0..9 ], sub {
+        #     $foo => sqrt($foo);
+        # });
+        ($self, $varRef, $arrayRef, $sub) = @_;
+    }
+    my $i = -1;
+    $self->while( sub { ++$i <= $#{$arrayRef} }, sub {
+        # Setup either $varRef or $_, if no such given before calling $sub->()
+        if ($varRef) {
+            $$varRef = $i;
+        } else {
+            $_ = $i;
+        }
+        $sub->();
+    });
 }
 
 package Parallel::Loops::TiedHash;
@@ -452,11 +447,10 @@ sub STORE {
     $$hash{$key} = $value;
 }
 
-sub dumpChildInfo {
+sub getChildInfo {
     my ($self, $outputNr) = @_;
     my $extra = $$self[1];
-    my $dumper = Data::Dumper->new([$extra->{childKeys}],["output[$outputNr]"]);
-    return $dumper->Dump();
+    return $extra->{childKeys};
 }
 
 package Parallel::Loops::TiedArray;
@@ -491,10 +485,9 @@ sub PUSH {
     push( @{ $self->{arr} }, @_ );
 }
 
-sub dumpChildInfo {
-    my ($self, $outputNr) = @_;
-    my $dumper = Data::Dumper->new([$self->{childArr}],["output[$outputNr]"]);
-    return $dumper->Dump();
+sub getChildInfo {
+    my ($self) = @_;
+    return $self->{childArr};
 }
 
 1;
