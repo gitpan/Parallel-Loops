@@ -1,6 +1,6 @@
 package Parallel::Loops;
 
-our $VERSION='0.03';
+our $VERSION='0.04';
 
 =head1 NAME
 
@@ -64,6 +64,31 @@ isn't required at all:
         # Again, this is executed in a forked child
         $_ => sqrt($_);
     });
+
+=head1 Exception/Error Handling / Dying
+
+If you want some measure of exception handling you can use eval in the child
+like this:
+
+    my %errors;
+    $pl->share( \%errors );
+    my %returnValues = $pl->foreach( [ 0..9 ], sub {
+        # Again, this is executed in a forked child
+        eval {
+            die "Bogus error"
+                if $_ == 3;
+            $_ => sqrt($_);
+        };
+        if ($@) {
+            $errors{$_} = $@;
+        }
+    });
+
+    # Now test %errors. $errors{3} should exist as teh only element
+
+Also, be sure not to call exit() in the child. That will just exit the child
+and that doesn't work. Right now, exit just makes the parent fail no-so-nicely.
+Patches to this that handle exit somehow are welcome.
 
 =head1 DESCRIPTION
 
@@ -157,10 +182,13 @@ to the parent's hash or array automatically when a child is finished.
 B<Note the limitation> Only keys being set like C<$hash{'key'} = 'value'> and
 arrays elements being pushed like C<push @array, 'value'> will be transfered to
 the parent. Unsetting keys, or setting particluar array elements with
-$array[3]='value' will be lost if done in the children. In the parent process
-all the %hashes and @arrays are full-fledged, and you can use all operations.
-But only these mentioned operations in the child processes make it back to the
+$array[3]='value' will be lost if done in the children. Also, if two different
+children set a value for the same key, a random one of them will be seen by the
 parent.
+
+In the parent process all the %hashes and @arrays are full-fledged, and you can
+use all operations.  But only these mentioned operations in the child processes
+make it back to the parent.
 
 =head3 Array element sequence not defined
 
@@ -277,7 +305,7 @@ use Parallel::ForkManager;
 use UNIVERSAL qw(isa);
 
 sub new {
-    my ($class, $maxProcs) = @_;
+    my ($class, $maxProcs, %options) = @_;
     my $self = { maxProcs => $maxProcs, shareNr => 0 };
     return bless $self, $class;
 }
@@ -286,15 +314,19 @@ sub share {
     my ($self, @tieRefs) = @_;
     foreach my $ref (@tieRefs) {
         if (ref $ref && isa $ref, 'HASH') {
+            my %initialContents =  %$ref;
             # $storage will point to the Parallel::Loops::TiedHash object
             my $storage;
             tie %$ref, 'Parallel::Loops::TiedHash', $self, \$storage;
+            %$ref = %initialContents;
             push @{$$self{tieObjects}}, $storage;
             push @{$$self{tieHashes}}, [$$self{shareNr}, $ref];
         } elsif (ref $ref && isa $ref, 'ARRAY') {
+            my @initialContents =  @$ref;
             # $storage will point to the Parallel::Loops::TiedArray object
             my $storage;
             tie @$ref, 'Parallel::Loops::TiedArray', $self, \$storage;
+            @$ref = @initialContents;
             push @{$$self{tieObjects}}, $storage;
             push @{$$self{tieArrays}}, [$$self{shareNr}, $ref];
         } else {
@@ -315,7 +347,18 @@ sub readChangesFromChild {
     while (<$childRdr>) {
         $childOutput .= $_;
     }
-    my @output = @{ Storable::thaw($childOutput) };
+
+    die "Error getting result contents from child"
+        if $childOutput eq '';
+
+    my @output;
+    eval {
+        @output = @{ Storable::thaw($childOutput) };
+    };
+    if ($@) {
+        die "Error interpreting result from child: $@";
+    }
+    my $error = shift @output;
     my $retval = shift @output;
 
     foreach my $set (@{$$self{tieHashes}}) {
@@ -330,13 +373,16 @@ sub readChangesFromChild {
             push @$a, $v;
         }
     }
+    if ($error) {
+        die "Error from child: $error";
+    }
     return @$retval;
 }
 
 sub printChangesToParent {
-    my ($self, $retval, $parentWtr) = @_;
+    my ($self, $error, $retval, $parentWtr) = @_;
     my $outputNr = 0;
-    my @childInfo = ($retval);
+    my @childInfo = ($error, $retval);
     foreach (@{$$self{tieObjects}}) {
         push @childInfo, $_->getChildInfo();
     }
@@ -376,14 +422,19 @@ sub while {
         }
 
         # We're running in the child
-        my @retval = $bodySub->();
+        my @retval;
+        eval {
+            @retval = $bodySub->();
+        };
+        my $error = $@;
+
         if (! defined wantarray) {
             # Lets not waste any energy printing stuff to the parent, if the
             # parent isn't going to use the return values anyway
             @retval = ();
         }
 
-        $self->printChangesToParent(\@retval, $parentWtr);
+        $self->printChangesToParent($error, \@retval, $parentWtr);
         close $parentWtr;
 
         $fm->finish($childCounter);    # pass an exit code to finish
@@ -413,9 +464,10 @@ sub foreach {
     $self->while( sub { ++$i <= $#{$arrayRef} }, sub {
         # Setup either $varRef or $_, if no such given before calling $sub->()
         if ($varRef) {
-            $$varRef = $i;
+            $$varRef = $arrayRef->[$i];
         } else {
-            $_ = $i;
+            $_ = $arrayRef->[$i];
+            # $_ = $i;
         }
         $sub->();
     });
