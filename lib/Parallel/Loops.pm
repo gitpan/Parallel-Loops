@@ -1,6 +1,10 @@
 package Parallel::Loops;
 
-our $VERSION='0.04';
+our $VERSION='0.05';
+
+# For Tie::ExtraHash - This was the earliest perl version in which I found this
+# class
+use 5.008;
 
 =head1 NAME
 
@@ -64,31 +68,6 @@ isn't required at all:
         # Again, this is executed in a forked child
         $_ => sqrt($_);
     });
-
-=head1 Exception/Error Handling / Dying
-
-If you want some measure of exception handling you can use eval in the child
-like this:
-
-    my %errors;
-    $pl->share( \%errors );
-    my %returnValues = $pl->foreach( [ 0..9 ], sub {
-        # Again, this is executed in a forked child
-        eval {
-            die "Bogus error"
-                if $_ == 3;
-            $_ => sqrt($_);
-        };
-        if ($@) {
-            $errors{$_} = $@;
-        }
-    });
-
-    # Now test %errors. $errors{3} should exist as teh only element
-
-Also, be sure not to call exit() in the child. That will just exit the child
-and that doesn't work. Right now, exit just makes the parent fail no-so-nicely.
-Patches to this that handle exit somehow are welcome.
 
 =head1 DESCRIPTION
 
@@ -211,6 +190,31 @@ loop, these will also be forked, and you'll essentially have
 $maxProcs^2 running processes. It wouldn't be too hard to implement
 such a check (either inside or outside this package).
 
+=head1 Exception/Error Handling / Dying
+
+If you want some measure of exception handling you can use eval in the child
+like this:
+
+    my %errors;
+    $pl->share( \%errors );
+    my %returnValues = $pl->foreach( [ 0..9 ], sub {
+        # Again, this is executed in a forked child
+        eval {
+            die "Bogus error"
+                if $_ == 3;
+            $_ => sqrt($_);
+        };
+        if ($@) {
+            $errors{$_} = $@;
+        }
+    });
+
+    # Now test %errors. $errors{3} should exist as the only element
+
+Also, be sure not to call exit() in the child. That will just exit the child
+and that doesn't work. Right now, exit just makes the parent fail no-so-nicely.
+Patches to this that handle exit somehow are welcome.
+
 =head1 SEE ALSO
 
 This module uses fork(). ithreads could have been possible too, but was not
@@ -237,7 +241,7 @@ These should all be in perl's core:
     use IO::Handle;
     use Tie::Array;
     use Tie::Hash;
-    use UNIVERSAL qw(isa);
+    use Scalar::Util qw(blessed);
 
 =head1 BUGS / ENHANCEMENTS
 
@@ -283,6 +287,10 @@ An alternative pointed out by the perlmonks chatterbox could be to use
 L<Devel::Declare|http://search.cpan.org/perldoc?Devel::Declare> "if I can stand
 pain".
 
+=head1 SOURCE REPOSITORY
+
+See the L<git source on github|https://github.com/pmorch/perl-Parallel-Loops>
+
 =head1 COPYRIGHT
 
 Copyright (c) 2008 Peter Valdemar Mørch <peter@morch.com>
@@ -299,10 +307,11 @@ and/or modify it under the same terms as Perl itself.
 use strict;
 use warnings;
 
+use Carp;
 use IO::Handle;
 use Storable;
 use Parallel::ForkManager;
-use UNIVERSAL qw(isa);
+use Scalar::Util qw(blessed);
 
 sub new {
     my ($class, $maxProcs, %options) = @_;
@@ -313,7 +322,9 @@ sub new {
 sub share {
     my ($self, @tieRefs) = @_;
     foreach my $ref (@tieRefs) {
-        if (ref $ref && isa $ref, 'HASH') {
+        croak "Can't share a blessed object"
+            if blessed $ref;
+        if (ref $ref eq 'HASH') {
             my %initialContents =  %$ref;
             # $storage will point to the Parallel::Loops::TiedHash object
             my $storage;
@@ -321,7 +332,7 @@ sub share {
             %$ref = %initialContents;
             push @{$$self{tieObjects}}, $storage;
             push @{$$self{tieHashes}}, [$$self{shareNr}, $ref];
-        } elsif (ref $ref && isa $ref, 'ARRAY') {
+        } elsif (ref $ref eq 'ARRAY') {
             my @initialContents =  @$ref;
             # $storage will point to the Parallel::Loops::TiedArray object
             my $storage;
@@ -330,7 +341,7 @@ sub share {
             push @{$$self{tieObjects}}, $storage;
             push @{$$self{tieArrays}}, [$$self{shareNr}, $ref];
         } else {
-            die "Only hash and array refs are supported by share";
+            croak "Only hash and array refs are supported by share";
         }
         $$self{shareNr}++;
     }
@@ -399,6 +410,7 @@ sub while {
         my ($pid) = @_;
         my $childRdr = $childHandles{$pid};
         push @retvals, $self->readChangesFromChild($childRdr);
+        close $childRdr;
     });
     my $childCounter = 0;
     while ($continueSub->()) {
@@ -422,6 +434,8 @@ sub while {
         }
 
         # We're running in the child
+        close $childRdr;
+
         my @retval;
         eval {
             @retval = $bodySub->();
@@ -467,7 +481,6 @@ sub foreach {
             $$varRef = $arrayRef->[$i];
         } else {
             $_ = $arrayRef->[$i];
-            # $_ = $i;
         }
         $sub->();
     });

@@ -1,5 +1,6 @@
-#!/usr/bin/perl -w
 use strict;
+use warnings;
+use Test::More;
 
 =head1 Testing Parallel Loops
 
@@ -8,12 +9,45 @@ We test the result structure and make sure it is what we expect. Then we do the 
 
 =cut
 
-use Test::More tests => 23;
 BEGIN { use_ok( 'Parallel::Loops' ); }
 
 my $maxProcs = 2;
-my $pl = new Parallel::Loops($maxProcs);
+my $pl = new_ok( 'Parallel::Loops', [$maxProcs] );
 
+# unit tests
+{
+    my @blessedArray;
+    bless \@blessedArray, 'His::Highness';
+    eval {
+        $pl->share( \@blessedArray );
+    };
+    my $err = $@;
+    $err
+        or die "Expected exception when trying to share a blessed object";
+    like(
+        $err,
+        qr/^Can't share a blessed object/,
+        "trying to share a blessed array fails",
+    );
+}
+
+{
+    my %blessedHash;
+    bless \%blessedHash, 'His::Highness';
+    eval {
+        $pl->share( \%blessedHash );
+    };
+    my $err = $@;
+    $err
+        or die "Expected exception when trying to share a blessed object";
+    like(
+        $err,
+        qr/^Can't share a blessed object/,
+        "trying to share a blessed hash fails",
+    );
+}
+
+# integration tests
 my @iterations = ( 0 .. 4 );
 
 my %output;
@@ -77,3 +111,4 @@ $pl->while (
 );
 checkResults();
 
+done_testing;
