@@ -1,6 +1,6 @@
 package Parallel::Loops;
 
-our $VERSION='0.05';
+our $VERSION='0.06';
 
 # For Tie::ExtraHash - This was the earliest perl version in which I found this
 # class
@@ -38,13 +38,14 @@ Parallel::Loops - Execute loops using parallel forked subprocesses
         # massive calculation that will be parallelized, so that
         # $maxProcs different processes are calculating sqrt
         # simultaneously for different values of $_ on different CPUs
+        # (Do see 'Performance and properties of the loop body' below)
 
         $returnValues{$_} = sqrt($_);
     });
     foreach (@parameters) {
         printf "i: %d sqrt(i): %f\n", $_, $returnValues{$_};
     }
-  
+
 You can also use @arrays instead of %hashes, and/or while loops
 instead of foreach:
 
@@ -135,10 +136,10 @@ Note that incrementing $i in the $childBodySub like in this example
 B<will not work>:
 
    $pl->while( sub { $i < 5 },
-               sub { 
+               sub {
                    $output{$i} = sqrt($i);
                    # Won't work!
-                   $i++ 
+                   $i++
                }
              );
 
@@ -148,7 +149,7 @@ parent, where $conditionSub is evaluated. The changes that make
 $conditionSub return false eventually I<must> take place outside
 the $childBodySub so it is executed in the parent. (Adhering to
 the parallel principle that one iteration may not affect any other
-iterations - including whether to run them or not) 
+iterations - including whether to run them or not)
 
 =head2 share
 
@@ -215,6 +216,19 @@ Also, be sure not to call exit() in the child. That will just exit the child
 and that doesn't work. Right now, exit just makes the parent fail no-so-nicely.
 Patches to this that handle exit somehow are welcome.
 
+=head1 Performance and properties of the loop body
+
+Keep in mind that a child process is forked every time while or foreach calls
+the provided sub. For use of Parallel::Loops to make sense, each invocation
+needs to actually do some serious work for the performance gain of parallel
+execution to outweigh the overhead of forking and communicating between the
+processes. So while sqrt() in the example above is simple, it will actually be
+slower than just running it in a standard foreach loop because of the overhead.
+
+Also, if each loop sub returns a massive amount of data, this needs to be
+communicated back to the parent process, and again that could outweigh parallel
+performance gains unless the loop body does some heavy work too.
+
 =head1 SEE ALSO
 
 This module uses fork(). ithreads could have been possible too, but was not
@@ -241,7 +255,6 @@ These should all be in perl's core:
     use IO::Handle;
     use Tie::Array;
     use Tie::Hash;
-    use Scalar::Util qw(blessed);
 
 =head1 BUGS / ENHANCEMENTS
 
@@ -256,7 +269,7 @@ also create forks.
 Determine the number of CPUs so that new()'s $maxProcs parameter can be
 optional. Could use e.g. Sys::Sysconf, UNIX::Processors or Sys::CPU.
 
-Maybe use function prototypes (see Prototypes under perldoc perlsub). 
+Maybe use function prototypes (see Prototypes under perldoc perlsub).
 
 Then we could do something like
 
@@ -295,7 +308,7 @@ See the L<git source on github|https://github.com/pmorch/perl-Parallel-Loops>
 
 Copyright (c) 2008 Peter Valdemar Mørch <peter@morch.com>
 
-All right reserved. This program is free software; you can redistribute it 
+All right reserved. This program is free software; you can redistribute it
 and/or modify it under the same terms as Perl itself.
 
 =head1 AUTHOR
@@ -309,9 +322,9 @@ use warnings;
 
 use Carp;
 use IO::Handle;
+use IO::Select;
 use Storable;
 use Parallel::ForkManager;
-use Scalar::Util qw(blessed);
 
 sub new {
     my ($class, $maxProcs, %options) = @_;
@@ -322,8 +335,6 @@ sub new {
 sub share {
     my ($self, @tieRefs) = @_;
     foreach my $ref (@tieRefs) {
-        croak "Can't share a blessed object"
-            if blessed $ref;
         if (ref $ref eq 'HASH') {
             my %initialContents =  %$ref;
             # $storage will point to the Parallel::Loops::TiedHash object
@@ -341,7 +352,7 @@ sub share {
             push @{$$self{tieObjects}}, $storage;
             push @{$$self{tieArrays}}, [$$self{shareNr}, $ref];
         } else {
-            croak "Only hash and array refs are supported by share";
+            croak "Only unblessed hash and array refs are supported by share";
         }
         $$self{shareNr}++;
     }
@@ -354,11 +365,9 @@ sub in_child {
 
 sub readChangesFromChild {
     my ($self, $childRdr) = @_;
-    my $childOutput = '';
-    while (<$childRdr>) {
-        $childOutput .= $_;
-    }
 
+    local $/;
+    my $childOutput = <$childRdr>;
     die "Error getting result contents from child"
         if $childOutput eq '';
 
@@ -397,22 +406,26 @@ sub printChangesToParent {
     foreach (@{$$self{tieObjects}}) {
         push @childInfo, $_->getChildInfo();
     }
-    print $parentWtr Storable::freeze(\@childInfo); 
+    {
+        local $SIG{PIPE} = sub {
+            die "Couldn't print to pipe";
+        };
+        print $parentWtr Storable::freeze(\@childInfo);
+    }
 }
 
 sub while {
     my ($self, $continueSub, $bodySub) = @_;
     my %childHandles;
+    my @retvals;
+    my $childCounter = 0;
+    my $nrRunningChildren = 0;
+    my $select = IO::Select->new();
     my $fm = Parallel::ForkManager->new($$self{maxProcs});
     $$self{forkManager} = $fm;
-    my @retvals;
     $fm->run_on_finish( sub {
-        my ($pid) = @_;
-        my $childRdr = $childHandles{$pid};
-        push @retvals, $self->readChangesFromChild($childRdr);
-        close $childRdr;
+        $nrRunningChildren--;
     });
-    my $childCounter = 0;
     while ($continueSub->()) {
         # Setup pipes so the child can send info back to the parent about
         # output data.
@@ -423,14 +436,22 @@ sub while {
         binmode $parentWtr;
         binmode $childRdr;
         $parentWtr->autoflush(1);
-        
-        my $pid = $fm->start( ++$childCounter );
 
-        if ($pid) {
+        # Read data from children that are ready. Block if maxProcs has been
+        # reached, so that we are sure to close some file handle(s).
+        for my $fh ( $select->can_read($nrRunningChildren >= $$self{maxProcs} ?
+                                        undef : 0) ) {
+            push @retvals, $self->readChangesFromChild($fh);
+            $select->remove($fh);
+            close $fh;
+        }
+
+        if ($fm->start( ++$childCounter )) {
             # We're running in the parent...
+            $nrRunningChildren++;
             close $parentWtr;
-            $childHandles{$pid} = $childRdr;
-            next; 
+            $select->add($childRdr);
+            next;
         }
 
         # We're running in the child
@@ -453,6 +474,15 @@ sub while {
 
         $fm->finish($childCounter);    # pass an exit code to finish
     }
+
+    while (my @ready = $select->can_read()) {
+        for my $fh (@ready) {
+            push @retvals, $self->readChangesFromChild($fh);
+            $select->remove($fh);
+            close $fh;
+        }
+    }
+
     $fm->wait_all_children;
     delete $$self{forkManager};
     return @retvals;
